@@ -4,8 +4,10 @@ import gym
 import numpy as np
 import itertools
 import torch
+import os
 from sac import SAC
 from replay_memory import ReplayMemory
+from d4rl_transition_model import EntireEnsembleModel
 
 parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
 parser.add_argument('--env-name', default="HalfCheetah-v2",
@@ -35,18 +37,32 @@ parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
                     help='hidden size (default: 256)')
 parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
                     help='model updates per simulator step (default: 1)')
-parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
+parser.add_argument('--start_steps', type=int, default=1000, metavar='N',
                     help='Steps sampling random actions (default: 10000)')
 parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
                     help='Value target update per no. of updates per step (default: 1)')
 parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
                     help='size of replay buffer (default: 10000000)')
-parser.add_argument('--cuda', action="store_true",
-                    help='run on CUDA (default: False)')
+parser.add_argument('--cuda', default=True,
+                    help='run on CUDA (default: True)')
+parser.add_argument('--mode', type=str, default='ski',
+                    help='Policy Type: SAC | SKI (default: Gaussian)')
+parser.add_argument('--max_rollout_len', type=int, default=50,
+                    help='Maximum of rollout length')
 args = parser.parse_args()
 
 # Environment
 # env = NormalizedActions(gym.make(args.env_name))
+
+device = 'cuda:2' if torch.cuda.is_available() else 'cpu'
+start_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M")
+
+transition_model = EntireEnsembleModel(input_size=17+6, encoder_hidden_size=64, encoder_output_size=64, transition_model_hidden_size=64, transition_model_output_size=18, ensemble_size=5, learning_rate=0.0005, device=device)
+transition_model.load_model("2021-08-05-07-58")
+transition_model.to(device)
+
+mode = args.mode
+
 env = gym.make(args.env_name)
 env.seed(args.seed)
 env.action_space.seed(args.seed)
@@ -63,43 +79,99 @@ memory = ReplayMemory(args.replay_size, args.seed)
 # Training Loop
 total_numsteps = 0
 updates = 0
+train_avg_rewards = list()
+test_avg_rewards = list()
+
+print(args.cuda)
 
 for i_episode in itertools.count(1):
     episode_reward = 0
     episode_steps = 0
     done = False
     state = env.reset()
+    
+    if mode == 'sac':
+        rollout_len = 0
+        while (not done) and (rollout_len < args.max_rollout_len):
+            if args.start_steps > total_numsteps:
+                action = env.action_space.sample()  # Sample random action
+            else:
+                action = agent.select_action(state)  # Sample action from policy
 
-    while not done:
-        if args.start_steps > total_numsteps:
-            action = env.action_space.sample()  # Sample random action
-        else:
-            action = agent.select_action(state)  # Sample action from policy
+            if len(memory) > args.batch_size:
+                # Number of updates per step in environment
+                for i in range(args.updates_per_step):
+                    # Update parameters of all the networks
+                    critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(memory, args.batch_size, updates)
+                    updates += 1
 
-        if len(memory) > args.batch_size:
-            # Number of updates per step in environment
-            for i in range(args.updates_per_step):
-                # Update parameters of all the networks
-                critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(memory, args.batch_size, updates)
-                updates += 1
+            next_state, reward, done, _ = env.step(action) # Step
+            episode_steps += 1
+            total_numsteps += 1
+            episode_reward += reward
 
-        next_state, reward, done, _ = env.step(action) # Step
-        episode_steps += 1
-        total_numsteps += 1
-        episode_reward += reward
+            # Ignore the "done" signal if it comes from hitting the time horizon.
+            # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
+            mask = 1 if episode_steps == env._max_episode_steps else float(not done)
 
-        # Ignore the "done" signal if it comes from hitting the time horizon.
-        # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
-        mask = 1 if episode_steps == env._max_episode_steps else float(not done)
+            memory.push(state, action, reward, next_state, mask) # Append transition to memory
 
-        memory.push(state, action, reward, next_state, mask) # Append transition to memory
+            state = next_state
+            rollout_len += 1
 
-        state = next_state
+        if total_numsteps > args.num_steps:
+            break
 
-    if total_numsteps > args.num_steps:
-        break
+        train_avg_rewards.append(episode_reward)
 
-    print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
+        print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
+
+    elif mode == 'ski':
+        rollout_len = 0
+        while rollout_len < args.max_rollout_len:
+            if args.start_steps > total_numsteps:
+                action = env.action_space.sample()  # Sample random action
+            else:
+                action = agent.select_action(state)  # Sample action from policy
+
+            if len(memory) > args.batch_size:
+                # Number of updates per step in environment
+                for i in range(args.updates_per_step):
+                    # Update parameters of all the networks
+                    critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(memory, args.batch_size, updates)
+                    updates += 1
+
+            state = torch.tensor(state, dtype=torch.float, device=device)
+            action = torch.tensor(action, dtype=torch.float, device=device)
+            next_state_reward = transition_model(state.unsqueeze(0), action.unsqueeze(0)) # Step
+            next_state = next_state_reward.squeeze()[:17]
+            reward = next_state_reward.squeeze()[17]
+            
+            state = state.cpu().detach().numpy()
+            action = action.cpu().detach().numpy()
+            reward = reward.cpu().detach().numpy()
+            next_state = next_state.cpu().detach().numpy()
+
+            episode_steps += 1
+            total_numsteps += 1
+            episode_reward += reward
+
+            # Ignore the "done" signal if it comes from hitting the time horizon.
+            # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
+            mask = 1 if episode_steps == env._max_episode_steps else float(not done)
+            memory.push(state, action, reward, next_state, mask) # Append transition to memory
+
+            state = next_state
+            rollout_len += 1
+
+        if total_numsteps > args.num_steps:
+            break
+
+        train_avg_rewards.append(episode_reward)
+
+        print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
+
+    np.save(os.path.join('score_results', "{}_{}_{}_rollout_train.npy".format(mode, start_time, args.max_rollout_len)), np.array(train_avg_rewards))
 
     if i_episode % 10 == 0 and args.eval is True:
         avg_reward = 0.
@@ -118,13 +190,13 @@ for i_episode in itertools.count(1):
                 state = next_state
             avg_reward += episode_reward
         avg_reward /= episodes
-
-
-        writer.add_scalar('avg_reward/test', avg_reward, i_episode)
+        test_avg_rewards.append(round(avg_reward, 2))
 
         print("----------------------------------------")
         print("Test Episodes: {}, Avg. Reward: {}".format(episodes, round(avg_reward, 2)))
         print("----------------------------------------")
+    
+    np.save(os.path.join('score_results', "{}_{}_{}_rollout_test.npy".format(mode, start_time, args.max_rollout_len)), np.array(test_avg_rewards))
 
 env.close()
 
