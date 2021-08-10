@@ -8,10 +8,17 @@
 ├── replay_memory.py
 ├── sac.py
 ├── utils.py
-├── score_results (save train/test rewards as npy)
-├── result (save train/test MSE loss of transition model)
-└── model_pt (save a model of best performance)
+├── get_logger.py
+├── model_pt (save model parameters with best performance)
+├── reward_results (save train/test rewards as npy)
+└── transition_model_loss (save train/test MSE loss of transition model in logger and plotting forms)
 ``` 
+
+### Training Transition Model
+```
+e.g. python d4rl_transition_model.py --relative_gaussian_noise 0.1 --epochs 150
+```
+
 ### Training
 ```
 e.g. python main.py --env-name HalfCheetah-v2 --mode ski --max_rollout_len 50
