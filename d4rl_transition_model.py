@@ -10,8 +10,9 @@ import os
 import tqdm
 import matplotlib.pyplot as plt
 import datetime
-
+import argparse
 import time
+from get_logger import get_logger
 
 class BigEncoder(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -29,7 +30,7 @@ class BigEncoder(nn.Module):
         return self.encoder(x)
 
 class StochasticTransitionModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, device='cpu', minimum_std = 0.001):
+    def __init__(self, input_size, hidden_size, output_size, device='cpu', minimum_std = 0.001, gaussian_noise_std=0):
         super(StochasticTransitionModel, self).__init__()
 
         self.make_prob_parameters = nn.Sequential(
@@ -42,6 +43,7 @@ class StochasticTransitionModel(nn.Module):
 
         self.minimum_std = minimum_std
         self.output_size = output_size
+        self.gaussian_noise_std = gaussian_noise_std
         self.device = device
 
     def forward(self, x):
@@ -114,8 +116,10 @@ class D4rlDataset(nn.Module):
     def __len__(self):
         return self.state_array.shape[0]
 
-def get_dataloader(dataset, device):
-    pin_memory = False if device=='cpu' else True   
+def get_dataloader(dataset, device, args):
+    pin_memory = False if device=='cpu' else True
+    batch_size = args.batch_size
+    num_workers = args.num_workers   
 
     whole_ind = np.arange(dataset['observations'].shape[0])
     train_ind, val_ind = train_test_split(whole_ind, test_size=0.1, random_state = 42)
@@ -131,31 +135,41 @@ def get_dataloader(dataset, device):
         test_dataset[key] = dataset[key][test_ind]
 
     d4rl_train_dataset = D4rlDataset(dataset)
-    d4rl_train_dataloader = DataLoader(d4rl_train_dataset, batch_size=2000, shuffle=True, drop_last=False, pin_memory=pin_memory, num_workers=32)
+    d4rl_train_dataloader = DataLoader(d4rl_train_dataset, batch_size=batch_size, shuffle=True, drop_last=False, pin_memory=pin_memory, num_workers=num_workers)
 
     d4rl_val_dataset = D4rlDataset(dataset)
-    d4rl_val_dataloader = DataLoader(d4rl_val_dataset, batch_size=2000, shuffle=False, drop_last=False, pin_memory=pin_memory, num_workers=32)
+    d4rl_val_dataloader = DataLoader(d4rl_val_dataset, batch_size=batch_size, shuffle=False, drop_last=False, pin_memory=pin_memory, num_workers=num_workers)
 
     d4rl_test_dataset = D4rlDataset(dataset)
-    d4rl_test_dataloader = DataLoader(d4rl_test_dataset, batch_size=2000, shuffle=False, drop_last=False, pin_memory=pin_memory, num_workers=32)
+    d4rl_test_dataloader = DataLoader(d4rl_test_dataset, batch_size=batch_size, shuffle=False, drop_last=False, pin_memory=pin_memory, num_workers=num_workers)
     return d4rl_train_dataloader, d4rl_val_dataloader, d4rl_test_dataloader
 
-def train_transition_model(model, start_time, device):
+def train_transition_model(model, start_time, device, d4rl_std, args, logger):
     loss_fn = nn.MSELoss()
-    epochs = 150
+    epochs = args.epochs
     train_losses = []
     val_losses = []
     best_val_loss = 1e8
-    
+    state_std, action_std = d4rl_std
+
+    # relative_state_std shape : (17,) in case 'HalfCheetah-v2'
+    # relative_action_std shape : (6,) in case 'HalfCheetah-v2'
+    relative_state_std = state_std * args.relative_gaussian_noise 
+    relative_action_std = action_std * args.relative_gaussian_noise
+
     for epoch in tqdm.tqdm(range(epochs)):
         loss_sum = 0
         for row in d4rl_train_dataloader:
+            # Make noise term
+            state_noise = torch.randn(args.batch_size, len(state_std), device=device) * torch.tensor(relative_state_std, dtype=torch.float, device=device)
+            action_noise = torch.randn(args.batch_size, len(action_std), device=device) * torch.tensor(relative_action_std, dtype=torch.float, device=device)
+
             state = row['state'].to(device)
             reward = row['reward'].to(device)
             action = row['action'].to(device)
             next_state = row['next_state'].to(device)
 
-            next_state_reward_prediction = model(state, action)
+            next_state_reward_prediction = model(state+state_noise, action+action_noise)
             next_state_reward = torch.cat((next_state, reward.unsqueeze(1)), dim=1)
             loss = loss_fn(next_state_reward, next_state_reward_prediction)
 
@@ -166,8 +180,9 @@ def train_transition_model(model, start_time, device):
             loss_sum += loss.item()
         
         train_losses.append(loss_sum/len(d4rl_train_dataloader))
+        msg = '{} Epoch, Train Mean Loss: {}'.format(epoch, loss_sum/len(d4rl_train_dataloader))
+        logger.info(msg)
 
-        print('Train Mean Loss at {} epoch: {}'.format(loss_sum/len(d4rl_train_dataloader), epoch))
         loss_sum = 0
         with torch.no_grad():
             for row in d4rl_val_dataloader:
@@ -183,35 +198,51 @@ def train_transition_model(model, start_time, device):
                 loss_sum += loss.item()
         
         val_losses.append(loss_sum/len(d4rl_train_dataloader))
-        print('Validation Mean Loss at {} epoch: {}'.format(loss_sum/len(d4rl_train_dataloader), epoch))
+        msg = '{} Epoch, Validation Mean Loss: {}'.format(epoch, loss_sum/len(d4rl_train_dataloader))
+        logger.info(msg)
         
         plt.plot(train_losses, label='train loss', color='r')
         plt.plot(val_losses, label='validation loss', color='b')
+
         if epoch == 0:
             plt.legend()
-        plt.savefig('result/{}.png'.format(start_time))
+        plt.savefig('transition_model_loss/{}.png'.format(start_time))
+
         if loss_sum < best_val_loss:
             model.save_model(start_time)
             best_val_loss = loss_sum
+            msg = '\n\n\t Best Model Saved!!! \n'
+            logger.info(msg)
+
 
     return model
 
 if __name__ == '__main__':
+    # get Arguments
+    parser = argparse.ArgumentParser(description='SKI: Traning Transition Model Args')
+    parser.add_argument('--epochs', default=150, type=int, help='Set epochs to train Transition Model')
+    parser.add_argument('--relative_gaussian_noise', default=0, type=float, help='Relative gaussian noise to std in d4rl dataset')
+    parser.add_argument('--batch_size', default=2000, type=int, help='Batch size used in d4rl dataloader')
+    parser.add_argument('--num_workers', default=32, type=int, help='Num workers used in d4rl dataloader')
+    args = parser.parse_args()
 
     start_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M")
-    device = 'cuda:2' if torch.cuda.is_available() else 'cpu'
-    # torch.cuda.synchronize()
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    
+    # get logger
+    system_logger = get_logger(name='d4rl_transition_model', file_path=os.path.join('transition_model_loss', start_time + '_train_log.log'))
+    system_logger.info('===== Loss History of Transition Model =====')
 
     env = gym.make('halfcheetah-medium-expert-v2')
     env.reset()
     env.step(env.action_space.sample())
 
-    dataset = env.get_dataset()
+    # dataset = env.get_dataset()
     dataset = d4rl.qlearning_dataset(env)
     
-    d4rl_train_dataloader, d4rl_val_dataloader, d4rl_test_dataloader = get_dataloader(dataset, device)
+    d4rl_train_dataloader, d4rl_val_dataloader, d4rl_test_dataloader = get_dataloader(dataset, device, args)
 
     model = EntireEnsembleModel(input_size=17+6, encoder_hidden_size=64, encoder_output_size=64, transition_model_hidden_size=64, transition_model_output_size=18, ensemble_size=5, learning_rate=0.0005, device=device)
     model.to(device)
 
-    model = train_transition_model(model, start_time, device)
+    model = train_transition_model(model, start_time, device, (dataset['observations'].std(0), dataset['actions'].std(0)), args, system_logger)

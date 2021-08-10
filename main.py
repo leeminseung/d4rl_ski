@@ -82,14 +82,13 @@ updates = 0
 train_avg_rewards = list()
 test_avg_rewards = list()
 
-print(args.cuda)
-
 for i_episode in itertools.count(1):
     episode_reward = 0
     episode_steps = 0
     done = False
     state = env.reset()
     
+    # 'sac' mode means vanilla SAC without any modification
     if mode == 'sac':
         rollout_len = 0
         while (not done) and (rollout_len < args.max_rollout_len):
@@ -109,11 +108,7 @@ for i_episode in itertools.count(1):
             episode_steps += 1
             total_numsteps += 1
             episode_reward += reward
-
-            # Ignore the "done" signal if it comes from hitting the time horizon.
-            # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
             mask = 1 if episode_steps == env._max_episode_steps else float(not done)
-
             memory.push(state, action, reward, next_state, mask) # Append transition to memory
 
             state = next_state
@@ -126,6 +121,7 @@ for i_episode in itertools.count(1):
 
         print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
 
+    # 'ski' mode means traning agent process continues in a trained transition model
     elif mode == 'ski':
         rollout_len = 0
         while rollout_len < args.max_rollout_len:
@@ -144,7 +140,7 @@ for i_episode in itertools.count(1):
             state = torch.tensor(state, dtype=torch.float, device=device)
             action = torch.tensor(action, dtype=torch.float, device=device)
             next_state_reward = transition_model(state.unsqueeze(0), action.unsqueeze(0)) # Step
-            next_state = next_state_reward.squeeze()[:17]
+            next_state = next_state_reward.squeeze()[:17] # hard coded with 'HalfCheetah-v2'
             reward = next_state_reward.squeeze()[17]
             
             state = state.cpu().detach().numpy()
@@ -156,8 +152,6 @@ for i_episode in itertools.count(1):
             total_numsteps += 1
             episode_reward += reward
 
-            # Ignore the "done" signal if it comes from hitting the time horizon.
-            # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
             mask = 1 if episode_steps == env._max_episode_steps else float(not done)
             memory.push(state, action, reward, next_state, mask) # Append transition to memory
 
@@ -171,8 +165,10 @@ for i_episode in itertools.count(1):
 
         print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
 
-    np.save(os.path.join('score_results', "{}_{}_{}_rollout_train.npy".format(mode, start_time, args.max_rollout_len)), np.array(train_avg_rewards))
+    # reward results saved.
+    np.save(os.path.join('rewards_results', "{}_mode:_{}_rollout_step:_{}_train.npy".format(start_time, mode, args.max_rollout_len)), np.array(train_avg_rewards))
 
+    # Evalutaion Process starts.
     if i_episode % 10 == 0 and args.eval is True:
         avg_reward = 0.
         episodes = 10
@@ -196,7 +192,8 @@ for i_episode in itertools.count(1):
         print("Test Episodes: {}, Avg. Reward: {}".format(episodes, round(avg_reward, 2)))
         print("----------------------------------------")
     
-    np.save(os.path.join('score_results', "{}_{}_{}_rollout_test.npy".format(mode, start_time, args.max_rollout_len)), np.array(test_avg_rewards))
+    # reward results saved.
+    np.save(os.path.join('rewards_results', "{}_mode:_{}_rollout_step:_{}_test.npy".format(start_time, mode, args.max_rollout_len)), np.array(test_avg_rewards))
 
 env.close()
 
