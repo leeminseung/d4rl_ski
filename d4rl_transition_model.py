@@ -21,7 +21,7 @@ class BigEncoder(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size), 
             nn.ReLU(),
             nn.Linear(hidden_size, output_size)
         )
@@ -47,10 +47,11 @@ class StochasticTransitionModel(nn.Module):
         self.device = device
 
     def forward(self, x):
-        flatted_mu_std = self.make_prob_parameters(x)
-        reshaped_mu_std = flatted_mu_std.reshape(-1, self.output_size, 2)
-        mu = reshaped_mu_std[:, :, 0]
-        std = reshaped_mu_std[:, :, 1]
+        flatted_mu_logvar = self.make_prob_parameters(x)
+        reshaped_mu_logvar = flatted_mu_logvar.reshape(-1, self.output_size, 2)
+        mu = reshaped_mu_logvar[:, :, 0]
+        logvar = reshaped_mu_logvar[:, :, 1]
+        std = torch.exp(logvar).clone() # for network stability
 
         std += self.minimum_std
         epsilon = torch.randn((x.shape[0], self.output_size)).to(self.device)
@@ -61,15 +62,12 @@ class StochasticTransitionModel(nn.Module):
 class EntireEnsembleModel(nn.Module):
     def __init__(self, input_size, encoder_hidden_size, encoder_output_size, transition_model_hidden_size, transition_model_output_size, ensemble_size, learning_rate, device='cpu'):
         super(EntireEnsembleModel, self).__init__()
-        
-        t1 = time.time()
         self.ensemble_size = ensemble_size
         self.big_encoder = BigEncoder(input_size, encoder_hidden_size, encoder_output_size)
         self.stochastic_models = list()
         for _ in range(ensemble_size):
             self.stochastic_models.append(StochasticTransitionModel(encoder_hidden_size, transition_model_hidden_size, transition_model_output_size, device))
         
-        t1 = time.time()
         self.all_parameters = list(self.big_encoder.parameters())
         for idx in range(ensemble_size):
             self.all_parameters += list(self.stochastic_models[idx].parameters())
@@ -85,20 +83,38 @@ class EntireEnsembleModel(nn.Module):
         next_state_reward_prediction = selected_model(latent)
         return next_state_reward_prediction
 
+    def step(self, state, action): 
+        '''
+        used in evaluation process. different compared to 'forward' function in that this function uses mean value of ensemble model output.
+        '''
+        state_action = torch.cat((state, action), dim=1)
+        latent = self.big_encoder(state_action)
+        selected_model_idx = random.choice(range(len(self.stochastic_models)))
+        selected_model =self.stochastic_models[selected_model_idx]
+        next_state_reward_prediction = selected_model(latent)
+        return next_state_reward_prediction
+
     def save_model(self, path):
-        torch.save(self.big_encoder.state_dict(), os.path.join("model_pt", path + "_big_encoder.pt"))
+        torch.save(self.big_encoder.state_dict(), os.path.join("model_pt", path, "big_encoder.pt"))
         for idx in range(self.ensemble_size):
-            torch.save(self.stochastic_models[idx].state_dict(), os.path.join("model_pt", path + "_ensemble_{}.pt".format(idx)))
+            torch.save(self.stochastic_models[idx].state_dict(), os.path.join("model_pt", path, "ensemble_{}.pt".format(idx)))
 
     def load_model(self, path):
-        self.big_encoder.load_state_dict(torch.load(os.path.join("model_pt", path + "_big_encoder.pt")))
+        self.big_encoder.load_state_dict(torch.load(os.path.join("model_pt", path, "big_encoder.pt")))
         for idx in range(self.ensemble_size):        
-            self.stochastic_models[idx].load_state_dict(torch.load(os.path.join("model_pt", path + "_ensemble_{}.pt".format(idx))))
+            self.stochastic_models[idx].load_state_dict(torch.load(os.path.join("model_pt", path, "ensemble_{}.pt".format(idx))))
     
     def to(self, device):
         self.big_encoder = self.big_encoder.to(device)
         for idx in range(self.ensemble_size):
             self.stochastic_models[idx] = self.stochastic_models[idx].to(device)
+
+    def print_model(self, logger):
+        logger.info('\n\n')
+        logger.info()
+        logger.info(self.big_encoder)
+        logger.info(self.stochastic_models[0])
+        logger.info('\n')
 
 class D4rlDataset(nn.Module):
     def __init__(self, d4rl_dataset):
@@ -206,7 +222,9 @@ def train_transition_model(model, start_time, device, d4rl_std, args, logger):
 
         if epoch == 0:
             plt.legend()
-        plt.savefig('transition_model_loss/{}.png'.format(start_time))
+        plt.savefig(os.path.join('transition_model_loss', start_time, start_time + '.png'))
+        np.save(os.path.join('transition_model_loss', start_time, 'train_losses.npy'), np.array(train_losses))
+        np.save(os.path.join('transition_model_loss', start_time, 'val_losses.npy'), np.array(val_losses))
 
         if loss_sum < best_val_loss:
             model.save_model(start_time)
@@ -224,25 +242,39 @@ if __name__ == '__main__':
     parser.add_argument('--relative_gaussian_noise', default=0, type=float, help='Relative gaussian noise to std in d4rl dataset')
     parser.add_argument('--batch_size', default=2000, type=int, help='Batch size used in d4rl dataloader')
     parser.add_argument('--num_workers', default=32, type=int, help='Num workers used in d4rl dataloader')
+    parser.add_argument('--hidden_node', default=64, type=int, help='Number of hidden nodes')
+
     args = parser.parse_args()
 
     start_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M")
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:3' if torch.cuda.is_available() else 'cpu'
     
-    # get logger
-    system_logger = get_logger(name='d4rl_transition_model', file_path=os.path.join('transition_model_loss', start_time + '_train_log.log'))
-    system_logger.info('===== Loss History of Transition Model =====')
+    # make directory
+    if os.path.isdir(os.path.join("transition_model_loss", start_time)) and os.path.exists(os.path.join("transition_model_loss", start_time)):
+        print('Already Existing Directory. Please wait for 1 minute.')
+        exit()
+
+    os.mkdir(os.path.join("transition_model_loss", start_time))
+    os.mkdir(os.path.join("model_pt", start_time))    
 
     env = gym.make('halfcheetah-medium-expert-v2')
-    env.reset()
-    env.step(env.action_space.sample())
 
     # dataset = env.get_dataset()
     dataset = d4rl.qlearning_dataset(env)
     
     d4rl_train_dataloader, d4rl_val_dataloader, d4rl_test_dataloader = get_dataloader(dataset, device, args)
 
-    model = EntireEnsembleModel(input_size=17+6, encoder_hidden_size=64, encoder_output_size=64, transition_model_hidden_size=64, transition_model_output_size=18, ensemble_size=5, learning_rate=0.0005, device=device)
+    model = EntireEnsembleModel(input_size=17+6, encoder_hidden_size=args.hidden_node, encoder_output_size=args.hidden_node, transition_model_hidden_size=args.hidden_node, transition_model_output_size=18, ensemble_size=5, learning_rate=0.0005, device=device)
     model.to(device)
 
+    # record model structure
+    system_logger = get_logger(name='d4rl_transition_model', file_path=os.path.join('transition_model_loss', start_time, start_time + '_train_log.log'))
+
+    system_logger.info('===== Arguments information =====')
+    system_logger.info(vars(args))
+
+    system_logger.info('===== Model Structure =====')
+    model.print_model(system_logger)
+
+    system_logger.info('===== Loss History of Transition Model =====')
     model = train_transition_model(model, start_time, device, (dataset['observations'].std(0), dataset['actions'].std(0)), args, system_logger)
