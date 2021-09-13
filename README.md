@@ -10,6 +10,7 @@
 ├── utils.py
 ├── get_logger.py
 
+├── sk_data_and_model (make data for training SK model)
 ├── model_pt (save model parameters with best performance)
 ├── reward_results (save train/test rewards as npy)
 └── transition_model_loss (save train/test MSE loss of transition model in logger and plotting forms)
